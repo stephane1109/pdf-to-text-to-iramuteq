@@ -2,13 +2,14 @@
 # ------------------------------------------------------------
 # Application Streamlit pour extraire le texte de PDF et l'exporter en .txt
 # PyMuPDF (fitz) uniquement
-# - Métadonnées (affichage, sélection et injection dans la sortie .txt)
-# - Gestion des colonnes (auto / 1 / 2) avec explication intégrée
-# - Variables étoilées : insertion en tête du .txt d'une ligne "****" puis de paires définies par l'utilisateur
+# - Métadonnées (affichage, sélection et injection)
+# - Colonnes (auto / 1 / 2)
+# - En-tête variables étoilées sur UNE SEULE LIGNE : "**** *var1 *var2 ..."
+#   * pas de ":" ; pas d'astérisque en trop ; espaces -> "-_"
 # - Nettoyage : espaces, lignes vides, césures, numéros de page, en-têtes/pieds répétés
-# - Export individuel et en archive ZIP
+# - Export individuel et ZIP
 # - Bandeau sous le titre : ligne + www.codeandcortex.fr
-# - Mise en page large (wide) sur toute l’application
+# - Mise en page large (wide)
 # ------------------------------------------------------------
 
 import io
@@ -29,11 +30,11 @@ except Exception:
 
 
 # ------------------------------------------------------------
-# Fonctions utilitaires (toutes en français)
+# Fonctions utilitaires
 # ------------------------------------------------------------
 
 def lire_metadonnees_pdf(pdf_bytes: bytes) -> dict:
-    """Lire les métadonnées du PDF avec PyMuPDF et retourner un dictionnaire plat."""
+    """Lire les métadonnées du PDF avec PyMuPDF et retourner un dict plat."""
     meta = {
         "Titre": "",
         "Auteur": "",
@@ -74,9 +75,7 @@ def detecter_si_pdf_scanné(pdf_bytes: bytes, pages_test: int = 3, seuil_caract�
 
 
 def extraire_pages_pymupdf(pdf_bytes: bytes, mode_colonnes: str = "auto") -> list:
-    """Extraire le texte page par page via PyMuPDF avec heuristique de colonnes ('auto' | '1' | '2').
-    Retourne une liste contenant le texte de chaque page.
-    """
+    """Extraire le texte page par page avec heuristique de colonnes ('auto' | '1' | '2')."""
     textes_par_page = []
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
         for page in doc:
@@ -123,10 +122,7 @@ def extraire_pages_pymupdf(pdf_bytes: bytes, mode_colonnes: str = "auto") -> lis
 
 
 def nettoyer_pieds_entetes_repetes(textes_par_page: list, seuil_ratio: float = 0.6) -> list:
-    """Supprimer les en-têtes et pieds de page répétés.
-    Heuristique : on regarde la 1ère ligne non vide et la dernière ligne non vide de chaque page,
-    et on retire celles qui apparaissent sur au moins 'seuil_ratio' des pages.
-    """
+    """Supprimer les en-têtes et pieds de page répétés en détectant 1ère et dernière lignes fréquentes."""
     def premiere_ligne_non_vide(s: str) -> str:
         for l in s.splitlines():
             if l.strip():
@@ -152,10 +148,8 @@ def nettoyer_pieds_entetes_repetes(textes_par_page: list, seuil_ratio: float = 0
     nettoyees = []
     for p in textes_par_page:
         lignes = p.splitlines()
-        # Retrait haut
         while lignes and lignes[0].strip() in top_a_retirer:
             lignes.pop(0)
-        # Retrait bas
         while lignes and lignes[-1].strip() in bot_a_retirer:
             lignes.pop()
         nettoyees.append("\n".join(lignes))
@@ -163,16 +157,14 @@ def nettoyer_pieds_entetes_repetes(textes_par_page: list, seuil_ratio: float = 0
 
 
 def supprimer_numeros_de_page_isoles(textes_par_page: list) -> list:
-    """Supprimer les lignes qui ne contiennent qu'un numéro (ex: '12') au début/fin de page."""
+    """Supprimer les lignes ne contenant qu'un nombre en début/fin de page."""
     import re
     motif = re.compile(r"^\s*\d+\s*$")
     nettoyees = []
     for p in textes_par_page:
         lignes = p.splitlines()
-        # Début
         while lignes and motif.match(lignes[0]):
             lignes.pop(0)
-        # Fin
         while lignes and motif.match(lignes[-1]):
             lignes.pop()
         nettoyees.append("\n".join(lignes))
@@ -215,30 +207,37 @@ def appliquer_nettoyages(textes_par_page: list,
     return texte
 
 
+def encoder_nom_variable(var: str) -> str:
+    """Encoder le nom de variable : trim, remplace espaces par '-_' (deux mots -> '-_'), conserve les autres caractères."""
+    # On remplace tout bloc d'espaces par '-_'
+    nom = " ".join(var.split())  # normaliser espaces
+    nom = nom.replace(" ", "-_")
+    return nom
+
+
 def construire_entete_variables_etoilees(activer: bool, saisie: str) -> str:
-    """Construire la section en tête avec '****' suivi des variables étoilées utilisateur.
-    Format de saisie attendu (une variable par ligne) : nom=valeur
-    Rend :
-    ****
-    *nom* : valeur
-    *nom2* : valeur2
-    """
+    """Construire l'en-tête sur UNE SEULE LIGNE, au format : '**** *var1 *var2 ...'
+    - aucune présence de ':' ;
+    - pas d'astérisque en trop ;
+    - espaces dans les noms -> '-_';
+    - l'utilisateur peut saisir une variable par ligne, avec ou sans '=valeur' (valeur ignorée)."""
     if not activer:
         return ""
-    lignes = []
-    lignes.append("****")
+    variables = []
     for brut in saisie.splitlines():
-        if "=" in brut:
-            nom, val = brut.split("=", 1)
-            nom = nom.strip()
-            val = val.strip()
-            if nom:
-                lignes.append(f"*{nom}* : {val}")
-        elif brut.strip():
-            # Si l'utilisateur donne juste un mot, on l'insère avec valeur vide
-            lignes.append(f"*{brut.strip()}* :")
-    lignes.append("-" * 60)
-    return "\n".join(lignes) + "\n"
+        brut = brut.strip()
+        if not brut:
+            continue
+        # Si l'utilisateur écrit "nom=valeur", on garde seulement le nom
+        nom = brut.split("=", 1)[0].strip()
+        if not nom:
+            continue
+        nom = encoder_nom_variable(nom)
+        variables.append(f"*{nom}")
+    if not variables:
+        return "****\n"  # juste les étoiles si rien saisi
+    # Une seule ligne : **** suivi d'un espace puis chaque variable séparée par un espace
+    return "**** " + " ".join(variables) + "\n"
 
 
 def formater_sortie_texte(nom_fichier: str,
@@ -247,10 +246,10 @@ def formater_sortie_texte(nom_fichier: str,
                           inclure_meta: bool,
                           meta: dict,
                           champs_meta_selectionnes: list) -> str:
-    """Assembler le texte final : variables étoilées, métadonnées (optionnelles), puis corps."""
+    """Assembler le texte final : ligne variables étoilées (si activée), métadonnées (optionnelles), puis corps."""
     parties = []
 
-    if entete_vars.strip():
+    if entete_vars:
         parties.append(entete_vars.rstrip("\n"))
 
     if inclure_meta:
@@ -292,10 +291,9 @@ st.markdown(
 
 st.write(
     "Cette application utilise uniquement PyMuPDF (fitz). Elle gère les métadonnées, propose une lecture en 1 ou 2 colonnes, "
-    "et permet d'insérer des variables étoilées en tête du texte, ainsi que plusieurs options de nettoyage."
+    "permet d'insérer des variables étoilées sur une seule ligne en tête du texte, et offre plusieurs options de nettoyage."
 )
 
-# Barre latérale : tous les réglages
 with st.sidebar:
     st.header("Paramètres d'extraction")
 
@@ -305,15 +303,15 @@ with st.sidebar:
         index=0,
         help="Sélection du mode de lecture des colonnes."
     )
-    st.caption("Explication : 'auto' choisit automatiquement. '1' = lecture de gauche à droite de haut en bas. '2' = deux colonnes : colonne gauche puis colonne droite.")
+    st.caption("Explication : 'auto' choisit automatiquement. '1' = lecture séquentielle des blocs. '2' = deux colonnes (gauche puis droite).")
 
     with st.expander("Variables étoilées (en tête du .txt)"):
-        activer_vars = st.checkbox("Activer l'insertion de variables étoilées", value=False)
+        activer_vars = st.checkbox("Activer la ligne de variables étoilées", value=False)
         saisie_vars = st.text_area(
-            "Saisissez une variable par ligne au format nom=valeur",
+            "Saisissez une variable par ligne (facultatif '=valeur' ignoré). Les espaces seront encodés en '-_'.",
             value="",
             height=120,
-            help="Exemple :\nsource=JO officiel\nprojet=loi IA"
+            help="Exemples :\nprojet loi\nsource=JO officiel\nversion brouillon"
         )
 
     with st.expander("Métadonnées à inclure dans le .txt"):
@@ -332,7 +330,7 @@ with st.sidebar:
         enlever_num_pages = st.checkbox("Supprimer les numéros de page isolés", value=True)
         enlever_entetes_pieds = st.checkbox("Supprimer en-têtes et pieds répétés", value=True)
 
-# Zone centrale, en large : upload multi-fichiers et résultats
+# Upload multi-fichiers
 fichiers = st.file_uploader("Déposez un ou plusieurs PDF", type=["pdf"], accept_multiple_files=True)
 
 resultats = []
@@ -350,7 +348,7 @@ if fichiers:
         try:
             if detecter_si_pdf_scanné(data):
                 st.warning(f"{nom} semble contenir très peu de texte extractible. "
-                           f"S'il s'agit d'un scan, l'extraction peut être incomplète (pas d'OCR dans cette application).")
+                           f"S'il s'agit d'un scan, l'extraction peut être incomplète (pas d'OCR).")
         except Exception:
             pass
 
@@ -358,13 +356,10 @@ if fichiers:
         try:
             meta = lire_metadonnees_pdf(data)
         except Exception as e:
-            meta = {
-                "Titre": "", "Auteur": "", "Sujet": "", "Mots-clés": "",
-                "Créateur": "", "Producteur": "", "Créé le": "", "Modifié le": ""
-            }
+            meta = {k: "" for k in ["Titre", "Auteur", "Sujet", "Mots-clés", "Créateur", "Producteur", "Créé le", "Modifié le"]}
             st.info(f"Métadonnées non lues pour {nom} : {e}")
 
-        # Extraction PyMuPDF page à page
+        # Extraction
         erreur = None
         try:
             pages = extraire_pages_pymupdf(data, mode_colonnes=mode_colonnes)
@@ -372,7 +367,7 @@ if fichiers:
             pages = []
             erreur = str(e)
 
-        # Nettoyages
+        # Nettoyage
         texte_global = ""
         if not erreur:
             texte_global = appliquer_nettoyages(
@@ -384,7 +379,7 @@ if fichiers:
                 enlever_entetes_pieds=enlever_entetes_pieds
             )
 
-        # Variables étoilées en tête
+        # Ligne variables étoilées
         entete_vars = construire_entete_variables_etoilees(activer_vars, saisie_vars)
 
         # Assemblage final
@@ -402,18 +397,17 @@ if fichiers:
             txt_final = f"Erreur d'extraction pour {nom} :\n{erreur}"
             contenu_bytes = txt_final.encode("utf-8", errors="ignore")
 
-        # Aperçu en plein large
+        # Aperçu et métadonnées (wide)
         with st.expander(f"Aperçu et métadonnées : {nom}", expanded=False):
-            with st.container():
-                st.markdown("**Métadonnées détectées**")
-                for k, v in meta.items():
-                    st.write(f"**{k}** : {v if v else '—'}")
-                st.markdown("---")
-                st.markdown("**Aperçu du .txt**")
-                ap = txt_final[:10000]
-                if len(txt_final) > 10000:
-                    ap += "\n[...] (aperçu tronqué)"
-                st.code(ap, language="text")
+            st.markdown("**Métadonnées détectées**")
+            for k, v in meta.items():
+                st.write(f"**{k}** : {v if v else '—'}")
+            st.markdown("---")
+            st.markdown("**Aperçu du .txt**")
+            ap = txt_final[:10000]
+            if len(txt_final) > 10000:
+                ap += "\n[...] (aperçu tronqué)"
+            st.code(ap, language="text")
 
         # Téléchargement individuel
         st.download_button(
@@ -447,8 +441,4 @@ if fichiers:
 # requirements.txt minimal :
 #   streamlit
 #   PyMuPDF
-#
-# Remarques :
-# - L'application est en 'wide' via st.set_page_config(layout='wide') et l'interface centrale n'utilise pas de colonnes étroites.
-# - L'option colonnes : 'auto' décide tout seul ; '1' = lecture séquentielle des blocs ; '2' = deux colonnes (gauche puis droite).
 # ------------------------------------------------------------
