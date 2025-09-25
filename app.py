@@ -1,28 +1,26 @@
 # app.py
 # ------------------------------------------------------------
-# Application Streamlit pour extraire le texte de PDF et l'exporter en .txt
-# PyMuPDF (fitz) uniquement
-# - Métadonnées (affichage, sélection et injection)
-# - Colonnes (auto / 1 / 2)
-# - En-tête variables étoilées sur UNE SEULE LIGNE : "**** *var1 *var2 ..."
-#   * pas de ":" ; pas d'astérisque en trop ; espaces -> "-_"
-# - Nettoyage : espaces, lignes vides, césures, numéros de page, en-têtes/pieds répétés
-# - Export individuel et ZIP
-# - Bandeau sous le titre : ligne + www.codeandcortex.fr
-# - Mise en page large (wide)
+# Extraction PDF -> .txt (PyMuPDF uniquement)
+# Largeur 'wide', bandeau sous le titre (site), multi-fichiers
+# Variables étoilées sur UNE LIGNE : "**** *var1 *var2 ..." (espaces -> "-_")
+# Métadonnées (affichage + injection optionnelle)
+# Gestion des colonnes : auto / 1 / 2
+# Portée d'extraction colonnes : totale / gauche uniquement / droite uniquement
+# Limitation optionnelle à un intervalle de pages (ex : 3 à 98)
+# Réparation des espaces intra-mot / ligatures (reconstruction par mots, seuil réglable)
+# Nettoyages : espaces multiples, lignes vides, césures (incl. soft hyphen), numéros de page, en-têtes/pieds répétés
+# Export individuel et ZIP
 # ------------------------------------------------------------
 
 import io
 from pathlib import Path
 from datetime import datetime
 import zipfile
-from collections import Counter
+from collections import Counter, defaultdict
 
 import streamlit as st
 
-# ------------------------------------------------------------
-# Dépendance obligatoire : PyMuPDF
-# ------------------------------------------------------------
+# Dépendance obligatoire
 try:
     import fitz  # PyMuPDF
 except Exception:
@@ -30,32 +28,21 @@ except Exception:
 
 
 # ------------------------------------------------------------
-# Fonctions utilitaires
+# Utilitaires
 # ------------------------------------------------------------
 
 def lire_metadonnees_pdf(pdf_bytes: bytes) -> dict:
     """Lire les métadonnées du PDF avec PyMuPDF et retourner un dict plat."""
     meta = {
-        "Titre": "",
-        "Auteur": "",
-        "Sujet": "",
-        "Mots-clés": "",
-        "Créateur": "",
-        "Producteur": "",
-        "Créé le": "",
-        "Modifié le": "",
+        "Titre": "", "Auteur": "", "Sujet": "", "Mots-clés": "",
+        "Créateur": "", "Producteur": "", "Créé le": "", "Modifié le": "",
     }
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
         md = doc.metadata or {}
         correspondance = {
-            "title": "Titre",
-            "author": "Auteur",
-            "subject": "Sujet",
-            "keywords": "Mots-clés",
-            "creator": "Créateur",
-            "producer": "Producteur",
-            "creationDate": "Créé le",
-            "modDate": "Modifié le",
+            "title": "Titre", "author": "Auteur", "subject": "Sujet",
+            "keywords": "Mots-clés", "creator": "Créateur", "producer": "Producteur",
+            "creationDate": "Créé le", "modDate": "Modifié le",
         }
         for k_src, k_dst in correspondance.items():
             if k_src in md and md[k_src]:
@@ -64,7 +51,7 @@ def lire_metadonnees_pdf(pdf_bytes: bytes) -> dict:
 
 
 def detecter_si_pdf_scanné(pdf_bytes: bytes, pages_test: int = 3, seuil_caractères: int = 40) -> bool:
-    """Déterminer rapidement si le PDF contient très peu de texte extractible (probablement un scan)."""
+    """Heuristique simple : très peu de texte extractible => probablement un scan."""
     total = 0
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
         nb = min(len(doc), pages_test)
@@ -74,31 +61,114 @@ def detecter_si_pdf_scanné(pdf_bytes: bytes, pages_test: int = 3, seuil_caract�
     return total < seuil_caractères
 
 
-def extraire_pages_pymupdf(pdf_bytes: bytes, mode_colonnes: str = "auto") -> list:
-    """Extraire le texte page par page avec heuristique de colonnes ('auto' | '1' | '2')."""
+def _reconstruire_lignes_par_mots(words, seuil_jointure_pts: float = 1.0) -> str:
+    """Reconstruire le texte d'une page à partir de 'words' en recollant les segments trop proches (seuil en points).
+    'words' est une liste de tuples : (x0, y0, x1, y1, 'mot', block_no, line_no, word_no).
+    """
+    lignes = defaultdict(list)
+    for (x0, y0, x1, y1, w, bno, lno, wno) in words:
+        lignes[(bno, lno)].append((x0, x1, w))
+
+    lignes_ordonnees = []
+    for key in sorted(lignes.keys()):
+        mots = sorted(lignes[key], key=lambda t: t[0])
+        if not mots:
+            continue
+        morceaux = [mots[0][2]]
+        prev_x1 = mots[0][1]
+        for x0, x1, w in mots[1:]:
+            gap = x0 - prev_x1
+            if gap < seuil_jointure_pts:
+                morceaux[-1] = morceaux[-1] + w
+            else:
+                morceaux.append(w)
+            prev_x1 = x1
+        lignes_ordonnees.append(" ".join(morceaux))
+
+    return "\n".join(lignes_ordonnees)
+
+
+def _filtrer_par_portee_words(words, milieu: float, portee_colonnes: str):
+    """Filtrer la liste 'words' selon la portée colonnes choisie : 'totale' | 'gauche' | 'droite'."""
+    if portee_colonnes == "totale":
+        return words
+    if portee_colonnes == "gauche":
+        return [w for w in words if w[2] <= milieu]  # x1 <= milieu
+    if portee_colonnes == "droite":
+        return [w for w in words if w[0] >= milieu]  # x0 >= milieu
+    return words
+
+
+def _filtrer_par_portee_blocs(blocs, milieu: float, portee_colonnes: str):
+    """Filtrer la liste de blocs selon la portée colonnes : 'totale' | 'gauche' | 'droite'."""
+    if portee_colonnes == "totale":
+        return blocs
+    if portee_colonnes == "gauche":
+        return [b for b in blocs if b["x1"] <= milieu]
+    if portee_colonnes == "droite":
+        return [b for b in blocs if b["x0"] >= milieu]
+    return blocs
+
+
+def extraire_pages_pymupdf(pdf_bytes: bytes,
+                           mode_colonnes: str,
+                           portee_colonnes: str,
+                           reparer_ligatures: bool,
+                           seuil_jointure_pts: float,
+                           page_min_1based: int = 1,
+                           page_max_1based: int = 10**9) -> list:
+    """Extraire le texte page par page en respectant :
+    - mode_colonnes : 'auto' | '1' | '2'
+    - portee_colonnes : 'totale' | 'gauche' | 'droite'
+    - reparer_ligatures : True/False (reconstruction par mots)
+    - seuil_jointure_pts : seuil de collage pour la reconstruction
+    - intervalle de pages inclusif (1-based)
+    """
     textes_par_page = []
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
-        for page in doc:
+        n = len(doc)
+        pmin = max(1, page_min_1based)
+        pmax = min(n, page_max_1based)
+        if pmin > pmax:
+            return []  # intervalle vide
+
+        for i in range(pmin - 1, pmax):  # indices 0-based
+            page = doc[i]
+            largeur = page.rect.width
+            milieu = largeur / 2.0
+
+            if reparer_ligatures:
+                words = page.get_text("words") or []
+                words = _filtrer_par_portee_words(words, milieu, portee_colonnes)
+                texte_page = _reconstruire_lignes_par_mots(words, seuil_jointure_pts=seuil_jointure_pts)
+                textes_par_page.append(texte_page)
+                continue
+
+            # Mode blocs (colonnes)
             try:
                 blocs_raw = page.get_text("blocks")
             except Exception:
-                textes_par_page.append(page.get_text("text") or "")
+                # Extraction simple si les blocs ne sont pas disponibles
+                tout = page.get_text("text") or ""
+                # Filtrage gauche/droite approximatif impossible sans blocs : on renvoie tout
+                textes_par_page.append(tout)
                 continue
 
             blocs = []
             for b in blocs_raw:
                 if len(b) >= 5 and isinstance(b[4], str):
-                    blocs.append(
-                        {"x0": b[0], "y0": b[1], "x1": b[2], "y1": b[3], "text": (b[4] or "").strip()}
-                    )
-
+                    blocs.append({"x0": b[0], "y0": b[1], "x1": b[2], "y1": b[3], "text": (b[4] or "").strip()})
             blocs = [b for b in blocs if b["text"]]
             if not blocs:
                 textes_par_page.append(page.get_text("text") or "")
                 continue
 
-            largeur = page.rect.width
-            milieu = largeur / 2.0
+            # Filtrage par portée colonnes avant tri
+            blocs = _filtrer_par_portee_blocs(blocs, milieu, portee_colonnes)
+
+            if not blocs:
+                textes_par_page.append("")  # rien dans la portée demandée
+                continue
 
             mode = mode_colonnes
             if mode == "auto":
@@ -118,11 +188,12 @@ def extraire_pages_pymupdf(pdf_bytes: bytes, mode_colonnes: str = "auto") -> lis
                 texte_page = "\n".join(b["text"] for b in blocs)
 
             textes_par_page.append(texte_page)
+
     return textes_par_page
 
 
 def nettoyer_pieds_entetes_repetes(textes_par_page: list, seuil_ratio: float = 0.6) -> list:
-    """Supprimer les en-têtes et pieds de page répétés en détectant 1ère et dernière lignes fréquentes."""
+    """Supprimer les en-têtes/pieds répétés : 1ère et dernière lignes fréquentes."""
     def premiere_ligne_non_vide(s: str) -> str:
         for l in s.splitlines():
             if l.strip():
@@ -172,8 +243,9 @@ def supprimer_numeros_de_page_isoles(textes_par_page: list) -> list:
 
 
 def supprimer_cesures_en_fin_de_ligne(texte: str) -> str:
-    """Supprimer les césures en fin de ligne (mot coupé par un tiret suivi d'un retour)."""
+    """Supprimer les césures et le 'soft hyphen' U+00AD."""
     import re
+    texte = texte.replace("\u00AD", "")
     return re.sub(r"-\n(\S)", r"\1", texte)
 
 
@@ -208,24 +280,20 @@ def appliquer_nettoyages(textes_par_page: list,
 
 
 def encoder_nom_variable(var: str) -> str:
-    """Encoder le nom de variable : trim, supprime les astérisques inutiles, remplace espaces par '-_'."""
+    """Encoder un nom de variable : trim, supprimer astérisques initiaux, couper à '=', espaces -> '-_'."""
     var = var.strip()
     while var.startswith("*"):
         var = var[1:].lstrip()
-    # retirer ponctuation finale courante
     if var and var[-1] in {",", ";", ":"}:
         var = var[:-1].rstrip()
-    # ne garder que la partie avant '=' si fournie
     var = var.split("=", 1)[0].strip()
-    # normaliser les espaces et remplacer par '-_'
     var = " ".join(var.split())
     var = var.replace(" ", "-_")
     return var
 
 
 def construire_entete_variables_etoilees(saisie: str) -> str:
-    """Construire l'en-tête sur UNE SEULE LIGNE, au format : '**** *var1 *var2 ...'
-    Si aucune variable valide n'est fournie, renvoie une chaîne vide (pas d'en-tête ajouté)."""
+    """Une seule ligne : '**** *var1 *var2 ...' ; vide si aucune variable valide."""
     tokens = []
     for brut in saisie.splitlines():
         brut = brut.strip()
@@ -245,24 +313,20 @@ def formater_sortie_texte(nom_fichier: str,
                           inclure_meta: bool,
                           meta: dict,
                           champs_meta_selectionnes: list) -> str:
-    """Assembler le texte final : ligne variables étoilées (si non vide), métadonnées (optionnelles), puis corps."""
+    """Assembler : variables étoilées (si non vide), métadonnées (optionnelles), corps."""
     parties = []
-
     if entete_vars:
         parties.append(entete_vars.rstrip("\n"))
-
     if inclure_meta:
-        header = []
-        header.append(f"Fichier source : {nom_fichier}")
+        header = [f"Fichier source : {nom_fichier}"]
         for champ in champs_meta_selectionnes:
             if champ in meta and str(meta[champ]).strip():
                 header.append(f"{champ} : {meta[champ]}")
         header.append(f"Date d'extraction : {datetime.now().isoformat(timespec='seconds')}")
         header.append("-" * 60)
         parties.append("\n".join(header))
-
     parties.append(texte or "")
-    return "\n\n".join([p for p in parties if p is not None])
+    return "\n\n".join(parties)
 
 
 # ------------------------------------------------------------
@@ -277,7 +341,7 @@ if fitz is None:
 
 st.title("Extraction de PDF vers texte")
 
-# Bandeau sous le titre : ligne + site (sans LinkedIn)
+# Bandeau sous le titre (site)
 st.markdown(
     """
 <hr style="margin-top:0.5rem;margin-bottom:0.75rem;">
@@ -289,24 +353,56 @@ st.markdown(
 )
 
 st.write(
-    "Cette application utilise uniquement PyMuPDF (fitz). Elle gère les métadonnées, propose une lecture en 1 ou 2 colonnes, "
-    "permet d'insérer des variables étoilées sur une seule ligne en tête du texte, et offre plusieurs options de nettoyage."
+    "Application PyMuPDF (fitz) uniquement. Métadonnées, lecture 1/2 colonnes, variables étoilées en tête, "
+    "nettoyages, réparation des espaces intra-mot/ligatures, sélection de colonnes et intervalle de pages."
 )
 
 with st.sidebar:
     st.header("Paramètres d'extraction")
 
+    # Gestion colonnes
     mode_colonnes = st.selectbox(
         "Gestion des colonnes",
         options=["auto", "1", "2"],
         index=0,
-        help="Sélection du mode de lecture des colonnes."
+        help="auto choisit automatiquement; '1' = lecture séquentielle; '2' = deux colonnes (gauche puis droite)."
     )
-    st.caption("Explication : 'auto' choisit automatiquement. '1' = lecture séquentielle des blocs. '2' = deux colonnes (gauche puis droite).")
+    st.caption("Explication : 'auto' décide tout seul. '1' = haut→bas, gauche→droite. '2' = colonne gauche puis colonne droite.")
 
+    # Portée d'extraction pour documents en deux colonnes
+    portee_colonnes = st.selectbox(
+        "Portée d'extraction (colonnes)",
+        options=["Totale", "Colonne gauche uniquement", "Colonne droite uniquement"],
+        index=0,
+        help="Sélectionner la colonne à extraire lorsque le document est en deux colonnes."
+    )
+    # Normaliser en clés internes
+    mapping_portee = {
+        "Totale": "totale",
+        "Colonne gauche uniquement": "gauche",
+        "Colonne droite uniquement": "droite"
+    }
+    portee_colonnes_key = mapping_portee[portee_colonnes]
+
+    # Limitation à un intervalle de pages
+    limiter_pages = st.checkbox("Limiter l'extraction à un intervalle de pages", value=False,
+                                help="Exemple : cocher puis définir de 3 à 98 pour extraire seulement ces pages.")
+    page_debut = st.number_input("Page de début (1-based)", min_value=1, value=1, step=1, disabled=not limiter_pages)
+    page_fin = st.number_input("Page de fin (inclusif, 1-based)", min_value=1, value=9999, step=1, disabled=not limiter_pages)
+
+    # Réparation ligatures
+    with st.expander("Réparer espaces intra-mot / ligatures"):
+        reparer_ligatures = st.checkbox("Activer la reconstruction par mots (répare 'infl uence')", value=True)
+        seuil_jointure_pts = st.number_input(
+            "Seuil de jointure (points PDF)",
+            min_value=0.1, max_value=5.0, value=1.0, step=0.1,
+            help="Si la distance entre deux 'mots' est < seuil, ils sont recollés sans espace."
+        )
+
+    # Variables étoilées
     with st.expander("Variables étoilées (en tête du .txt)"):
         saisie_vars = st.text_area(
-            "Saisissez une variable par ligne (facultatif '=valeur' ignoré). Les espaces seront encodés en '-_'.",
+            "Une variable par ligne (optionnel '=valeur' ignoré). Espaces -> '-_'.",
             value="",
             height=120,
             help="Exemples :\nprojet loi\nsource=JO officiel\nversion brouillon"
@@ -317,6 +413,7 @@ with st.sidebar:
         else:
             st.caption("Aucun en-tête ne sera ajouté tant qu'aucune variable valide n'est saisie.")
 
+    # Métadonnées
     with st.expander("Métadonnées à inclure dans le .txt"):
         inclure_meta = st.checkbox("Inclure les métadonnées en tête du .txt", value=True)
         champs_possibles = ["Titre", "Auteur", "Sujet", "Mots-clés", "Créateur", "Producteur", "Créé le", "Modifié le"]
@@ -326,10 +423,11 @@ with st.sidebar:
             default=["Titre", "Auteur", "Sujet", "Mots-clés"]
         )
 
+    # Nettoyage
     with st.expander("Nettoyage du texte"):
         enlever_doubles_espaces = st.checkbox("Réduire les espacements multiples", value=True)
         compacter_lignes_vides = st.checkbox("Compacter les lignes vides successives", value=True)
-        enlever_cesures = st.checkbox("Supprimer les césures en fin de ligne", value=True)
+        enlever_cesures = st.checkbox("Supprimer les césures (y compris soft hyphen)", value=True)
         enlever_num_pages = st.checkbox("Supprimer les numéros de page isolés", value=True)
         enlever_entetes_pieds = st.checkbox("Supprimer en-têtes et pieds répétés", value=True)
 
@@ -362,15 +460,34 @@ if fichiers:
             meta = {k: "" for k in ["Titre", "Auteur", "Sujet", "Mots-clés", "Créateur", "Producteur", "Créé le", "Modifié le"]}
             st.info(f"Métadonnées non lues pour {nom} : {e}")
 
-        # Extraction
+        # Déterminer intervalle de pages effectif pour ce fichier
+        if limiter_pages:
+            # On clamp l'intervalle aux bornes du document
+            with fitz.open(stream=data, filetype="pdf") as doc_tmp:
+                n_pages = len(doc_tmp)
+            pmin = max(1, int(page_debut))
+            pmax = min(n_pages, int(page_fin))
+        else:
+            with fitz.open(stream=data, filetype="pdf") as doc_tmp:
+                pmin, pmax = 1, len(doc_tmp)
+
+        # Extraction (page par page) avec portée colonnes et intervalle
         erreur = None
         try:
-            pages = extraire_pages_pymupdf(data, mode_colonnes=mode_colonnes)
+            pages = extraire_pages_pymupdf(
+                data,
+                mode_colonnes=mode_colonnes,
+                portee_colonnes=portee_colonnes_key,
+                reparer_ligatures=reparer_ligatures,
+                seuil_jointure_pts=seuil_jointure_pts,
+                page_min_1based=pmin,
+                page_max_1based=pmax
+            )
         except Exception as e:
             pages = []
             erreur = str(e)
 
-        # Nettoyage
+        # Nettoyage global
         texte_global = ""
         if not erreur:
             texte_global = appliquer_nettoyages(
@@ -382,7 +499,7 @@ if fichiers:
                 enlever_entetes_pieds=enlever_entetes_pieds
             )
 
-        # Ligne variables étoilées (activée automatiquement si des variables valides sont saisies)
+        # Variables étoilées (si saisies)
         entete_vars = construire_entete_variables_etoilees(saisie_vars)
 
         # Assemblage final
@@ -400,7 +517,7 @@ if fichiers:
             txt_final = f"Erreur d'extraction pour {nom} :\n{erreur}"
             contenu_bytes = txt_final.encode("utf-8", errors="ignore")
 
-        # Aperçu et métadonnées (wide)
+        # Aperçu (wide)
         with st.expander(f"Aperçu et métadonnées : {nom}", expanded=False):
             st.markdown("**Métadonnées détectées**")
             for k, v in meta.items():
@@ -424,7 +541,10 @@ if fichiers:
         zf.writestr(Path(nom).with_suffix(".txt").name, contenu_bytes)
 
         # Récapitulatif
-        resultats.append((nom, "PyMuPDF (blocs/colonnes)", erreur is None, len(contenu_bytes)))
+        moteur_label = "PyMuPDF (reconstruction par mots)" if reparer_ligatures else f"PyMuPDF (colonnes {mode_colonnes})"
+        portee_label = {"totale": "Totale", "gauche": "Colonne gauche", "droite": "Colonne droite"}[portee_colonnes_key]
+        intervalle_label = f"pages {pmin}-{pmax}"
+        resultats.append((nom, moteur_label, portee_label, intervalle_label, (erreur is None), len(contenu_bytes)))
 
     zf.close()
     st.download_button(
@@ -435,12 +555,11 @@ if fichiers:
     )
 
     st.subheader("Récapitulatif des extractions")
-    for nom, moteur_eff, ok, taille in resultats:
-        st.write(f"{'OK' if ok else 'Échec'} • {nom} • Moteur : {moteur_eff} • Taille sortie : {taille} octets")
+    for nom, moteur_eff, portee_eff, intervalle_eff, ok, taille in resultats:
+        st.write(f"{'OK' if ok else 'Échec'} • {nom} • Moteur : {moteur_eff} • Portée : {portee_eff} • Intervalle : {intervalle_eff} • Taille : {taille} octets")
 
 
 # ------------------------------------------------------------
-# Déploiement Streamlit Cloud :
 # requirements.txt minimal :
 #   streamlit
 #   PyMuPDF
