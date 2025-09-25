@@ -208,36 +208,35 @@ def appliquer_nettoyages(textes_par_page: list,
 
 
 def encoder_nom_variable(var: str) -> str:
-    """Encoder le nom de variable : trim, remplace espaces par '-_' (deux mots -> '-_'), conserve les autres caractères."""
-    # On remplace tout bloc d'espaces par '-_'
-    nom = " ".join(var.split())  # normaliser espaces
-    nom = nom.replace(" ", "-_")
-    return nom
+    """Encoder le nom de variable : trim, supprime les astérisques inutiles, remplace espaces par '-_'."""
+    var = var.strip()
+    while var.startswith("*"):
+        var = var[1:].lstrip()
+    # retirer ponctuation finale courante
+    if var and var[-1] in {",", ";", ":"}:
+        var = var[:-1].rstrip()
+    # ne garder que la partie avant '=' si fournie
+    var = var.split("=", 1)[0].strip()
+    # normaliser les espaces et remplacer par '-_'
+    var = " ".join(var.split())
+    var = var.replace(" ", "-_")
+    return var
 
 
-def construire_entete_variables_etoilees(activer: bool, saisie: str) -> str:
+def construire_entete_variables_etoilees(saisie: str) -> str:
     """Construire l'en-tête sur UNE SEULE LIGNE, au format : '**** *var1 *var2 ...'
-    - aucune présence de ':' ;
-    - pas d'astérisque en trop ;
-    - espaces dans les noms -> '-_';
-    - l'utilisateur peut saisir une variable par ligne, avec ou sans '=valeur' (valeur ignorée)."""
-    if not activer:
-        return ""
-    variables = []
+    Si aucune variable valide n'est fournie, renvoie une chaîne vide (pas d'en-tête ajouté)."""
+    tokens = []
     for brut in saisie.splitlines():
         brut = brut.strip()
         if not brut:
             continue
-        # Si l'utilisateur écrit "nom=valeur", on garde seulement le nom
-        nom = brut.split("=", 1)[0].strip()
-        if not nom:
-            continue
-        nom = encoder_nom_variable(nom)
-        variables.append(f"*{nom}")
-    if not variables:
-        return "****\n"  # juste les étoiles si rien saisi
-    # Une seule ligne : **** suivi d'un espace puis chaque variable séparée par un espace
-    return "**** " + " ".join(variables) + "\n"
+        nom = encoder_nom_variable(brut)
+        if nom:
+            tokens.append(f"*{nom}")
+    if not tokens:
+        return ""
+    return "**** " + " ".join(tokens) + "\n"
 
 
 def formater_sortie_texte(nom_fichier: str,
@@ -246,7 +245,7 @@ def formater_sortie_texte(nom_fichier: str,
                           inclure_meta: bool,
                           meta: dict,
                           champs_meta_selectionnes: list) -> str:
-    """Assembler le texte final : ligne variables étoilées (si activée), métadonnées (optionnelles), puis corps."""
+    """Assembler le texte final : ligne variables étoilées (si non vide), métadonnées (optionnelles), puis corps."""
     parties = []
 
     if entete_vars:
@@ -306,13 +305,17 @@ with st.sidebar:
     st.caption("Explication : 'auto' choisit automatiquement. '1' = lecture séquentielle des blocs. '2' = deux colonnes (gauche puis droite).")
 
     with st.expander("Variables étoilées (en tête du .txt)"):
-        activer_vars = st.checkbox("Activer la ligne de variables étoilées", value=False)
         saisie_vars = st.text_area(
             "Saisissez une variable par ligne (facultatif '=valeur' ignoré). Les espaces seront encodés en '-_'.",
             value="",
             height=120,
             help="Exemples :\nprojet loi\nsource=JO officiel\nversion brouillon"
         )
+        apercu_entete = construire_entete_variables_etoilees(saisie_vars)
+        if apercu_entete:
+            st.code(apercu_entete.strip("\n"), language="text")
+        else:
+            st.caption("Aucun en-tête ne sera ajouté tant qu'aucune variable valide n'est saisie.")
 
     with st.expander("Métadonnées à inclure dans le .txt"):
         inclure_meta = st.checkbox("Inclure les métadonnées en tête du .txt", value=True)
@@ -379,8 +382,8 @@ if fichiers:
                 enlever_entetes_pieds=enlever_entetes_pieds
             )
 
-        # Ligne variables étoilées
-        entete_vars = construire_entete_variables_etoilees(activer_vars, saisie_vars)
+        # Ligne variables étoilées (activée automatiquement si des variables valides sont saisies)
+        entete_vars = construire_entete_variables_etoilees(saisie_vars)
 
         # Assemblage final
         if not erreur:
