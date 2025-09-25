@@ -8,7 +8,9 @@
 # Portée d'extraction colonnes : totale / gauche uniquement / droite uniquement
 # Limitation optionnelle à un intervalle de pages (ex : 3 à 98)
 # Réparation des espaces intra-mot / ligatures (reconstruction par mots, seuil réglable)
-# Nettoyages : espaces multiples, lignes vides, césures (incl. soft hyphen), numéros de page, en-têtes/pieds répétés
+# Nettoyages : espaces multiples, lignes vides, césures (incl. soft hyphen), numéros de page,
+#              en-têtes/pieds répétés (détection multi-lignes) + motifs regex personnalisés
+# Option supplémentaire : passer tout le texte en minuscules
 # Export individuel et ZIP
 # ------------------------------------------------------------
 
@@ -18,6 +20,7 @@ from datetime import datetime
 import zipfile
 from collections import Counter, defaultdict
 
+import re
 import streamlit as st
 
 # Dépendance obligatoire
@@ -28,7 +31,7 @@ except Exception:
 
 
 # ------------------------------------------------------------
-# Utilitaires
+# Utilitaires : métadonnées, heuristiques scan
 # ------------------------------------------------------------
 
 def lire_metadonnees_pdf(pdf_bytes: bytes) -> dict:
@@ -61,10 +64,12 @@ def detecter_si_pdf_scanné(pdf_bytes: bytes, pages_test: int = 3, seuil_caract�
     return total < seuil_caractères
 
 
+# ------------------------------------------------------------
+# Reconstruction par mots (corrige 'infl uence')
+# ------------------------------------------------------------
+
 def _reconstruire_lignes_par_mots(words, seuil_jointure_pts: float = 1.0) -> str:
-    """Reconstruire le texte d'une page à partir de 'words' en recollant les segments trop proches (seuil en points).
-    'words' est une liste de tuples : (x0, y0, x1, y1, 'mot', block_no, line_no, word_no).
-    """
+    """Reconstruire le texte d'une page à partir de 'words' en recollant les segments trop proches."""
     lignes = defaultdict(list)
     for (x0, y0, x1, y1, w, bno, lno, wno) in words:
         lignes[(bno, lno)].append((x0, x1, w))
@@ -88,8 +93,11 @@ def _reconstruire_lignes_par_mots(words, seuil_jointure_pts: float = 1.0) -> str
     return "\n".join(lignes_ordonnees)
 
 
+# ------------------------------------------------------------
+# Gestion colonnes et portée
+# ------------------------------------------------------------
+
 def _filtrer_par_portee_words(words, milieu: float, portee_colonnes: str):
-    """Filtrer la liste 'words' selon la portée colonnes choisie : 'totale' | 'gauche' | 'droite'."""
     if portee_colonnes == "totale":
         return words
     if portee_colonnes == "gauche":
@@ -100,7 +108,6 @@ def _filtrer_par_portee_words(words, milieu: float, portee_colonnes: str):
 
 
 def _filtrer_par_portee_blocs(blocs, milieu: float, portee_colonnes: str):
-    """Filtrer la liste de blocs selon la portée colonnes : 'totale' | 'gauche' | 'droite'."""
     if portee_colonnes == "totale":
         return blocs
     if portee_colonnes == "gauche":
@@ -117,22 +124,16 @@ def extraire_pages_pymupdf(pdf_bytes: bytes,
                            seuil_jointure_pts: float,
                            page_min_1based: int = 1,
                            page_max_1based: int = 10**9) -> list:
-    """Extraire le texte page par page en respectant :
-    - mode_colonnes : 'auto' | '1' | '2'
-    - portee_colonnes : 'totale' | 'gauche' | 'droite'
-    - reparer_ligatures : True/False (reconstruction par mots)
-    - seuil_jointure_pts : seuil de collage pour la reconstruction
-    - intervalle de pages inclusif (1-based)
-    """
+    """Extraction page par page avec options colonnes, portée et reconstruction par mots."""
     textes_par_page = []
     with fitz.open(stream=pdf_bytes, filetype="pdf") as doc:
         n = len(doc)
         pmin = max(1, page_min_1based)
         pmax = min(n, page_max_1based)
         if pmin > pmax:
-            return []  # intervalle vide
+            return []
 
-        for i in range(pmin - 1, pmax):  # indices 0-based
+        for i in range(pmin - 1, pmax):
             page = doc[i]
             largeur = page.rect.width
             milieu = largeur / 2.0
@@ -144,14 +145,10 @@ def extraire_pages_pymupdf(pdf_bytes: bytes,
                 textes_par_page.append(texte_page)
                 continue
 
-            # Mode blocs (colonnes)
             try:
                 blocs_raw = page.get_text("blocks")
             except Exception:
-                # Extraction simple si les blocs ne sont pas disponibles
-                tout = page.get_text("text") or ""
-                # Filtrage gauche/droite approximatif impossible sans blocs : on renvoie tout
-                textes_par_page.append(tout)
+                textes_par_page.append(page.get_text("text") or "")
                 continue
 
             blocs = []
@@ -163,11 +160,9 @@ def extraire_pages_pymupdf(pdf_bytes: bytes,
                 textes_par_page.append(page.get_text("text") or "")
                 continue
 
-            # Filtrage par portée colonnes avant tri
             blocs = _filtrer_par_portee_blocs(blocs, milieu, portee_colonnes)
-
             if not blocs:
-                textes_par_page.append("")  # rien dans la portée demandée
+                textes_par_page.append("")
                 continue
 
             mode = mode_colonnes
@@ -192,44 +187,120 @@ def extraire_pages_pymupdf(pdf_bytes: bytes,
     return textes_par_page
 
 
-def nettoyer_pieds_entetes_repetes(textes_par_page: list, seuil_ratio: float = 0.6) -> list:
-    """Supprimer les en-têtes/pieds répétés : 1ère et dernière lignes fréquentes."""
-    def premiere_ligne_non_vide(s: str) -> str:
-        for l in s.splitlines():
-            if l.strip():
-                return l.strip()
-        return ""
+# ------------------------------------------------------------
+# Nettoyages dont en-têtes/pieds multi-lignes + regex perso
+# ------------------------------------------------------------
 
-    def derniere_ligne_non_vide(s: str) -> str:
-        for l in reversed(s.splitlines()):
-            if l.strip():
-                return l.strip()
-        return ""
+def _normaliser_ligne(s: str) -> str:
+    """Normaliser pour comparaison : strip, compacter espaces, retirer soft hyphen."""
+    s = s.replace("\u00AD", "")
+    s = " ".join(s.strip().split())
+    return s
 
-    premieres = [premiere_ligne_non_vide(p) for p in textes_par_page]
-    dernieres = [derniere_ligne_non_vide(p) for p in textes_par_page]
 
-    c_top = Counter([l for l in premieres if l])
-    c_bot = Counter([l for l in dernieres if l])
+def _premieres_k_lignes_non_vides(s: str, k: int) -> list:
+    out = []
+    for l in s.splitlines():
+        if l.strip():
+            out.append(l)
+            if len(out) >= k:
+                break
+    return out
 
+
+def _dernieres_k_lignes_non_vides(s: str, k: int) -> list:
+    out = []
+    for l in reversed(s.splitlines()):
+        if l.strip():
+            out.append(l)
+            if len(out) >= k:
+                break
+    out.reverse()
+    return out
+
+
+def nettoyer_entetes_pieds_multilignes(textes_par_page: list,
+                                       k_lignes: int = 3,
+                                       seuil_ratio: float = 0.6) -> list:
+    """Retirer des bandeaux multi-lignes répétés en haut et en bas.
+    Méthode
+      1. On prélève pour chaque page les k premières et k dernières lignes non vides
+      2. On normalise et on compte les occurrences de séquences (jusqu'à k lignes)
+      3. On retire des pages toutes les séquences qui dépassent le seuil de répétition
+    """
     n = len(textes_par_page)
-    top_a_retirer = {l for l, c in c_top.items() if c >= max(2, int(seuil_ratio * n))}
-    bot_a_retirer = {l for l, c in c_bot.items() if c >= max(2, int(seuil_ratio * n))}
+    if n == 0:
+        return textes_par_page
 
+    # Collecte des candidates
+    top_seqs = Counter()
+    bot_seqs = Counter()
+    tops_by_page = []
+    bots_by_page = []
+
+    for p in textes_par_page:
+        top = _premieres_k_lignes_non_vides(p, k_lignes)
+        bot = _dernieres_k_lignes_non_vides(p, k_lignes)
+        tops_by_page.append(top)
+        bots_by_page.append(bot)
+        # toutes les longueurs possibles 1..k
+        for L in range(1, k_lignes + 1):
+            if len(top) >= L:
+                norm = tuple(_normaliser_ligne(x) for x in top[:L])
+                if all(norm):
+                    top_seqs[norm] += 1
+            if len(bot) >= L:
+                norm = tuple(_normaliser_ligne(x) for x in bot[-L:])
+                if all(norm):
+                    bot_seqs[norm] += 1
+
+    # Sélection des séquences à retirer
+    seuil_pages = max(2, int(seuil_ratio * n))
+    tops_a_retirer = {seq for seq, c in top_seqs.items() if c >= seuil_pages}
+    bots_a_retirer = {seq for seq, c in bot_seqs.items() if c >= seuil_pages}
+
+    # Retrait effectif
     nettoyees = []
     for p in textes_par_page:
         lignes = p.splitlines()
-        while lignes and lignes[0].strip() in top_a_retirer:
-            lignes.pop(0)
-        while lignes and lignes[-1].strip() in bot_a_retirer:
-            lignes.pop()
+        # Retrait haut
+        for L in range(k_lignes, 0, -1):
+            cand = _premieres_k_lignes_non_vides("\n".join(lignes), L)
+            norm = tuple(_normaliser_ligne(x) for x in cand[:L])
+            if norm and norm in tops_a_retirer:
+                # supprimer exactement L lignes non vides à partir du haut
+                to_remove = L
+                new_lines = []
+                skipped = 0
+                for l in lignes:
+                    if l.strip() and skipped < to_remove:
+                        skipped += 1
+                        continue
+                    new_lines.append(l)
+                lignes = new_lines
+                break  # on réévalue pas d'autres L
+        # Retrait bas
+        for L in range(k_lignes, 0, -1):
+            cand = _dernieres_k_lignes_non_vides("\n".join(lignes), L)
+            norm = tuple(_normaliser_ligne(x) for x in cand[-L:])
+            if norm and norm in bots_a_retirer:
+                # supprimer exactement L lignes non vides à partir du bas
+                to_remove = L
+                new_lines = []
+                skipped = 0
+                for l in reversed(lignes):
+                    if l.strip() and skipped < to_remove:
+                        skipped += 1
+                        continue
+                    new_lines.append(l)
+                lignes = list(reversed(new_lines))
+                break
         nettoyees.append("\n".join(lignes))
     return nettoyees
 
 
 def supprimer_numeros_de_page_isoles(textes_par_page: list) -> list:
     """Supprimer les lignes ne contenant qu'un nombre en début/fin de page."""
-    import re
     motif = re.compile(r"^\s*\d+\s*$")
     nettoyees = []
     for p in textes_par_page:
@@ -244,9 +315,22 @@ def supprimer_numeros_de_page_isoles(textes_par_page: list) -> list:
 
 def supprimer_cesures_en_fin_de_ligne(texte: str) -> str:
     """Supprimer les césures et le 'soft hyphen' U+00AD."""
-    import re
     texte = texte.replace("\u00AD", "")
     return re.sub(r"-\n(\S)", r"\1", texte)
+
+
+def appliquer_regex_personnalisees(texte: str, motifs_raw: str) -> str:
+    """Appliquer des regex ligne entière. Un motif par ligne, syntaxe Python, option IGNORECASE."""
+    motifs = [m.strip() for m in motifs_raw.splitlines() if m.strip()]
+    if not motifs:
+        return texte
+    res = []
+    compiled = [re.compile(m, flags=re.IGNORECASE) for m in motifs]
+    for l in texte.splitlines():
+        if any(c.fullmatch(l.strip()) for c in compiled):
+            continue
+        res.append(l)
+    return "\n".join(res)
 
 
 def appliquer_nettoyages(textes_par_page: list,
@@ -254,30 +338,42 @@ def appliquer_nettoyages(textes_par_page: list,
                          compacter_lignes_vides: bool,
                          enlever_cesures: bool,
                          enlever_num_pages: bool,
-                         enlever_entetes_pieds: bool) -> str:
+                         enlever_entetes_pieds: bool,
+                         k_lignes_ep: int,
+                         seuil_ratio_ep: float,
+                         motifs_regex_ep: str,
+                         to_lower: bool) -> str:
     """Appliquer les nettoyages demandés et retourner un texte global."""
     pages = textes_par_page[:]
 
     if enlever_entetes_pieds:
-        pages = nettoyer_pieds_entetes_repetes(pages, seuil_ratio=0.6)
+        pages = nettoyer_entetes_pieds_multilignes(pages, k_lignes=k_lignes_ep, seuil_ratio=seuil_ratio_ep)
     if enlever_num_pages:
         pages = supprimer_numeros_de_page_isoles(pages)
 
     texte = "\n\n".join(pages)
 
+    if motifs_regex_ep.strip():
+        texte = appliquer_regex_personnalisees(texte, motifs_regex_ep)
+
     if enlever_cesures:
         texte = supprimer_cesures_en_fin_de_ligne(texte)
 
     if enlever_doubles_espaces:
-        import re
         texte = re.sub(r"[ \t]{2,}", " ", texte)
 
     if compacter_lignes_vides:
-        import re
         texte = re.sub(r"\n{3,}", "\n\n", texte)
+
+    if to_lower:
+        texte = texte.lower()
 
     return texte
 
+
+# ------------------------------------------------------------
+# Variables étoilées
+# ------------------------------------------------------------
 
 def encoder_nom_variable(var: str) -> str:
     """Encoder un nom de variable : trim, supprimer astérisques initiaux, couper à '=', espaces -> '-_'."""
@@ -353,14 +449,13 @@ st.markdown(
 )
 
 st.write(
-    "Application PyMuPDF (fitz) uniquement. Métadonnées, lecture 1/2 colonnes, variables étoilées en tête, "
-    "nettoyages, réparation des espaces intra-mot/ligatures, sélection de colonnes et intervalle de pages."
+    "Application PyMuPDF (fitz) uniquement. Métadonnées, lecture 1/2 colonnes, sélection de colonnes, "
+    "intervalle de pages, variables étoilées en tête, réparations et nettoyages avancés."
 )
 
 with st.sidebar:
     st.header("Paramètres d'extraction")
 
-    # Gestion colonnes
     mode_colonnes = st.selectbox(
         "Gestion des colonnes",
         options=["auto", "1", "2"],
@@ -369,28 +464,19 @@ with st.sidebar:
     )
     st.caption("Explication : 'auto' décide tout seul. '1' = haut→bas, gauche→droite. '2' = colonne gauche puis colonne droite.")
 
-    # Portée d'extraction pour documents en deux colonnes
     portee_colonnes = st.selectbox(
         "Portée d'extraction (colonnes)",
         options=["Totale", "Colonne gauche uniquement", "Colonne droite uniquement"],
         index=0,
-        help="Sélectionner la colonne à extraire lorsque le document est en deux colonnes."
+        help="Utile si le PDF à deux colonnes mélange deux langues par page."
     )
-    # Normaliser en clés internes
-    mapping_portee = {
-        "Totale": "totale",
-        "Colonne gauche uniquement": "gauche",
-        "Colonne droite uniquement": "droite"
-    }
+    mapping_portee = {"Totale": "totale", "Colonne gauche uniquement": "gauche", "Colonne droite uniquement": "droite"}
     portee_colonnes_key = mapping_portee[portee_colonnes]
 
-    # Limitation à un intervalle de pages
-    limiter_pages = st.checkbox("Limiter l'extraction à un intervalle de pages", value=False,
-                                help="Exemple : cocher puis définir de 3 à 98 pour extraire seulement ces pages.")
+    limiter_pages = st.checkbox("Limiter l'extraction à un intervalle de pages", value=False)
     page_debut = st.number_input("Page de début (1-based)", min_value=1, value=1, step=1, disabled=not limiter_pages)
     page_fin = st.number_input("Page de fin (inclusif, 1-based)", min_value=1, value=9999, step=1, disabled=not limiter_pages)
 
-    # Réparation ligatures
     with st.expander("Réparer espaces intra-mot / ligatures"):
         reparer_ligatures = st.checkbox("Activer la reconstruction par mots (répare 'infl uence')", value=True)
         seuil_jointure_pts = st.number_input(
@@ -399,7 +485,6 @@ with st.sidebar:
             help="Si la distance entre deux 'mots' est < seuil, ils sont recollés sans espace."
         )
 
-    # Variables étoilées
     with st.expander("Variables étoilées (en tête du .txt)"):
         saisie_vars = st.text_area(
             "Une variable par ligne (optionnel '=valeur' ignoré). Espaces -> '-_'.",
@@ -413,7 +498,6 @@ with st.sidebar:
         else:
             st.caption("Aucun en-tête ne sera ajouté tant qu'aucune variable valide n'est saisie.")
 
-    # Métadonnées
     with st.expander("Métadonnées à inclure dans le .txt"):
         inclure_meta = st.checkbox("Inclure les métadonnées en tête du .txt", value=True)
         champs_possibles = ["Titre", "Auteur", "Sujet", "Mots-clés", "Créateur", "Producteur", "Créé le", "Modifié le"]
@@ -423,13 +507,25 @@ with st.sidebar:
             default=["Titre", "Auteur", "Sujet", "Mots-clés"]
         )
 
-    # Nettoyage
     with st.expander("Nettoyage du texte"):
         enlever_doubles_espaces = st.checkbox("Réduire les espacements multiples", value=True)
         compacter_lignes_vides = st.checkbox("Compacter les lignes vides successives", value=True)
         enlever_cesures = st.checkbox("Supprimer les césures (y compris soft hyphen)", value=True)
         enlever_num_pages = st.checkbox("Supprimer les numéros de page isolés", value=True)
+
         enlever_entetes_pieds = st.checkbox("Supprimer en-têtes et pieds répétés", value=True)
+        k_lignes_ep = st.number_input("Nombre max de lignes à examiner en tête/pied (1-5)", min_value=1, max_value=5, value=3, step=1)
+        seuil_ratio_ep = st.slider("Seuil de répétition pour suppression", min_value=0.4, max_value=0.9, value=0.6, step=0.05,
+                                   help="Proportion minimale de pages où le motif apparaît pour être supprimé.")
+
+        motifs_regex_ep = st.text_area(
+            "Motifs regex personnalisés (optionnel, un par ligne, appliqués en suppression ligne entière)",
+            value="^\\s*CHAMBRE DES REPRÉSENTANTS.*$\\s*\n^\\s*BELGISCHE KAMER.*$\\s*\n^\\s*DOC\\s*\\d+.*$\\s*\n^\\s*\\d+\\s*$\\s*",
+            height=120,
+            help="Exemples adaptés aux bandeaux récurrents. Lignes correspondantes seront supprimées partout."
+        )
+
+        to_lower = st.checkbox("Passer tout le texte en minuscules", value=False)
 
 # Upload multi-fichiers
 fichiers = st.file_uploader("Déposez un ou plusieurs PDF", type=["pdf"], accept_multiple_files=True)
@@ -460,9 +556,8 @@ if fichiers:
             meta = {k: "" for k in ["Titre", "Auteur", "Sujet", "Mots-clés", "Créateur", "Producteur", "Créé le", "Modifié le"]}
             st.info(f"Métadonnées non lues pour {nom} : {e}")
 
-        # Déterminer intervalle de pages effectif pour ce fichier
+        # Intervalle de pages
         if limiter_pages:
-            # On clamp l'intervalle aux bornes du document
             with fitz.open(stream=data, filetype="pdf") as doc_tmp:
                 n_pages = len(doc_tmp)
             pmin = max(1, int(page_debut))
@@ -471,7 +566,7 @@ if fichiers:
             with fitz.open(stream=data, filetype="pdf") as doc_tmp:
                 pmin, pmax = 1, len(doc_tmp)
 
-        # Extraction (page par page) avec portée colonnes et intervalle
+        # Extraction
         erreur = None
         try:
             pages = extraire_pages_pymupdf(
@@ -496,10 +591,14 @@ if fichiers:
                 compacter_lignes_vides=compacter_lignes_vides,
                 enlever_cesures=enlever_cesures,
                 enlever_num_pages=enlever_num_pages,
-                enlever_entetes_pieds=enlever_entetes_pieds
+                enlever_entetes_pieds=enlever_entetes_pieds,
+                k_lignes_ep=k_lignes_ep,
+                seuil_ratio_ep=seuil_ratio_ep,
+                motifs_regex_ep=motifs_regex_ep,
+                to_lower=to_lower
             )
 
-        # Variables étoilées (si saisies)
+        # Variables étoilées
         entete_vars = construire_entete_variables_etoilees(saisie_vars)
 
         # Assemblage final
@@ -517,7 +616,7 @@ if fichiers:
             txt_final = f"Erreur d'extraction pour {nom} :\n{erreur}"
             contenu_bytes = txt_final.encode("utf-8", errors="ignore")
 
-        # Aperçu (wide)
+        # Aperçu
         with st.expander(f"Aperçu et métadonnées : {nom}", expanded=False):
             st.markdown("**Métadonnées détectées**")
             for k, v in meta.items():
