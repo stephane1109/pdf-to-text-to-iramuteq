@@ -192,14 +192,14 @@ def extraire_pages_pymupdf(pdf_bytes: bytes,
 # ------------------------------------------------------------
 
 def _normaliser_ligne(s: str) -> str:
-    """Normaliser pour comparaison : strip, compacter espaces, retirer soft hyphen."""
+    """Normaliser pour comparaison : strip, compacter espaces."""
     s = s.replace("\u00AD", "")
     s = " ".join(s.strip().split())
     return s
 
 
 def _strip_accents(s: str) -> str:
-    """Supprimer les accents par normalisation unicode (sans dépendance externe)."""
+    """Supprimer les accents par normalisation unicode."""
     s_norm = unicodedata.normalize('NFD', s)
     return "".join(ch for ch in s_norm if unicodedata.category(ch) != 'Mn')
 
@@ -228,7 +228,7 @@ def _dernieres_k_lignes_non_vides(s: str, k: int) -> list:
 def nettoyer_entetes_pieds_multilignes(textes_par_page: list,
                                        k_lignes: int = 3,
                                        seuil_ratio: float = 0.6) -> list:
-    """Retirer des bandeaux multi-lignes répétés en haut et en bas."""
+    """Retirer des bandeaux répétés en haut et en bas."""
     n = len(textes_par_page)
     if n == 0:
         return textes_par_page
@@ -456,7 +456,7 @@ def formater_sortie_texte(nom_fichier: str,
 st.set_page_config(page_title="Extraction PDF → Texte", page_icon="📄", layout="wide")
 
 if fitz is None:
-    st.error("PyMuPDF (fitz) est requis mais indisponible. Ajoutez 'PyMuPDF' dans requirements.txt et relancez l'application.")
+    st.error("PyMuPDF est requis mais indisponible. Ajoutez 'PyMuPDF' dans requirements.txt et relancez l'application.")
     st.stop()
 
 st.title("Extraction de PDF vers texte")
@@ -473,8 +473,8 @@ st.markdown(
 )
 
 st.write(
-    "Application PyMuPDF (fitz) uniquement. Métadonnées, lecture 1/2 colonnes, sélection de colonnes, "
-    "intervalle de pages, variables étoilées en tête, réparations et nettoyages avancés."
+    "Application PyMuPDF. Métadonnées, lecture 1/2 colonnes, sélection de colonnes, "
+    "intervalle de pages, variables étoilées en tête, nettoyages, regex..."
 )
 
 with st.sidebar:
@@ -511,7 +511,7 @@ with st.sidebar:
 
     with st.expander("Variables étoilées (en tête du .txt)"):
         saisie_vars = st.text_area(
-            "Une variable par ligne (optionnel '=valeur' ignoré). Espaces -> '-_'.",
+            "Une variable * par ligne. Espaces entre les mots, le script ajoute -> '-_'.",
             value="",
             height=120,
             help="Exemples :\nprojet loi\nsource=JO officiel\nversion brouillon"
@@ -522,7 +522,7 @@ with st.sidebar:
         else:
             st.caption("Aucun en-tête ne sera ajouté tant qu'aucune variable valide n'est saisie.")
 
-    with st.expander("Métadonnées à inclure dans le .txt"):
+    with st.expander("Métadonnées du pdf à inclure dans le .txt"):
         inclure_meta = st.checkbox("Inclure les métadonnées en tête du .txt", value=True)
         champs_possibles = ["Titre", "Auteur", "Sujet", "Mots-clés", "Créateur", "Producteur", "Créé le", "Modifié le"]
         champs_meta_selectionnes = st.multiselect(
@@ -534,27 +534,29 @@ with st.sidebar:
     with st.expander("Nettoyage du texte"):
         enlever_doubles_espaces = st.checkbox("Réduire les espacements multiples", value=True)
         compacter_lignes_vides = st.checkbox("Compacter les lignes vides successives", value=True)
-        enlever_cesures = st.checkbox("Supprimer les césures (y compris soft hyphen)", value=True)
+        enlever_cesures = st.checkbox("Supprimer les césures", value=True)
         enlever_num_pages = st.checkbox("Supprimer les numéros de page isolés", value=True)
 
-        enlever_entetes_pieds = st.checkbox("Supprimer en-têtes et pieds répétés", value=True)
+        enlever_entetes_pieds = st.checkbox("Supprimer en-têtes et pieds répétés (ReGex)", value=True)
         k_lignes_ep = st.number_input("Nombre max de lignes à examiner en tête/pied (1-5)", min_value=1, max_value=5, value=3, step=1)
         seuil_ratio_ep = st.slider("Seuil de répétition pour suppression", min_value=0.4, max_value=0.9, value=0.6, step=0.05,
                                    help="Proportion minimale de pages où le motif apparaît pour être supprimé.")
 
-        # Motifs fournis (pré-remplis). Le moteur de nettoyage les rend robustes aux espaces/accents.
+        # Motifs fournis (pré-remplis). Formes compactes, robustes via normalisations (espaces/accents).
         motifs_regex_ep = st.text_area(
             "Motifs regex personnalisés (un par ligne, correspondance sur la ligne entière après normalisations)",
             value=(
-                "H AMB R E 4 e S E S S ION D E L A 5 3 e L É G I S L A T U R E 2012 2013 KAMER 4 e ZI T T ING VAN DE 5 3 e ZI T T INGS P ERIODE\n"
-                "DOC 53 2880/001 3"
+                "^CHAMBRE4eSESSIONDELA53eLEGISLATURE$\n"
+                "^2012$\n"
+                "^DOC532880/0013$"
             ),
             height=120,
-            help="Ces deux motifs sont ceux que vous avez fournis (pied et haut de page). "
-                 "Ils sont comparés à des variantes normalisées (espaces/accents) pour une suppression robuste."
+            help="Formes compactes pensés pour matcher après normalisations (espaces/accents retirés). "
+                 "Ajoutez vos motifs, un par ligne."
         )
 
         to_lower = st.checkbox("Passer tout le texte en minuscules", value=False)
+
 
 # Upload multi-fichiers
 fichiers = st.file_uploader("Déposez un ou plusieurs PDF", type=["pdf"], accept_multiple_files=True)
