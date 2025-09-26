@@ -553,14 +553,17 @@ with st.sidebar:
         "^2012$\n"
         "^DOC532880/0013$\n"
         "^KAMER4eZITTINGVANDE53eZITTINGSPERIODE$\n"
-        "^2013$"
+        "^2013$\n"
+        "^DOC53$\n"
+        "^2880/001$"
         ),
         height=120,
         help="Formes compactes pensées pour matcher après normalisations (espaces/accents retirés). "
          "Ajoutez vos motifs, un par ligne."
-)
+        )
 
 to_lower = st.checkbox("Passer tout le texte en minuscules", value=False)
+
 
 
 
