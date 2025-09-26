@@ -459,7 +459,7 @@ if fitz is None:
     st.error("PyMuPDF est requis mais indisponible. Ajoutez 'PyMuPDF' dans requirements.txt et relancez l'application.")
     st.stop()
 
-st.title("Extraction de PDF vers texte")
+st.title("Extraction PDF to TEXT to IRAMUTEQ")
 
 # Bandeau sous le titre (site)
 st.markdown(
