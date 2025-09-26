@@ -539,7 +539,7 @@ with st.sidebar:
 
         enlever_entetes_pieds = st.checkbox("Supprimer en-têtes et pieds répétés (ReGex)", value=True)
         k_lignes_ep = st.number_input("Nombre max de lignes à examiner en tête/pied (1-5)", min_value=1, max_value=5, value=3, step=1)
-        seuil_ratio_ep = st.slider("Seuil de répétition pour suppression", min_value=0.4, max_value=0.9, value=0.6, step=0.05,
+        seuil_ratio_ep = st.slider("Seuil de répétition pour suppression", min_value=0.2, max_value=0.9, value=0.3, step=0.05,
                                    help="Proportion minimale de pages où le motif apparaît pour être supprimé.")
 
         # Motifs fournis (pré-remplis). Formes compactes, robustes via normalisations (espaces/accents).
