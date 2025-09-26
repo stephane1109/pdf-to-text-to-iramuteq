@@ -6,11 +6,11 @@
 # Métadonnées (affichage + injection optionnelle)
 # Gestion des colonnes : auto / 1 / 2
 # Portée d'extraction colonnes : totale / gauche uniquement / droite uniquement
-# Limitation optionnelle à un intervalle de pages (ex : 3 à 98)
+# Intervalle de pages (ex : 3 à 98)
 # Réparation des espaces intra-mot / ligatures (reconstruction par mots, seuil réglable)
 # Nettoyages : espaces multiples, lignes vides, césures (incl. soft hyphen), numéros de page,
-#              en-têtes/pieds répétés (détection multi-lignes) + motifs regex personnalisés
-# Option supplémentaire : passer tout le texte en minuscules
+#              en-têtes/pieds répétés (détection multi-lignes) + motifs regex personnalisés robustes aux espaces/accents
+# Option : passer tout le texte en minuscules
 # Export individuel et ZIP
 # ------------------------------------------------------------
 
@@ -19,7 +19,7 @@ from pathlib import Path
 from datetime import datetime
 import zipfile
 from collections import Counter, defaultdict
-
+import unicodedata
 import re
 import streamlit as st
 
@@ -188,7 +188,7 @@ def extraire_pages_pymupdf(pdf_bytes: bytes,
 
 
 # ------------------------------------------------------------
-# Nettoyages dont en-têtes/pieds multi-lignes + regex perso
+# Nettoyages dont en-têtes/pieds multi-lignes + regex perso robustes
 # ------------------------------------------------------------
 
 def _normaliser_ligne(s: str) -> str:
@@ -196,6 +196,12 @@ def _normaliser_ligne(s: str) -> str:
     s = s.replace("\u00AD", "")
     s = " ".join(s.strip().split())
     return s
+
+
+def _strip_accents(s: str) -> str:
+    """Supprimer les accents par normalisation unicode (sans dépendance externe)."""
+    s_norm = unicodedata.normalize('NFD', s)
+    return "".join(ch for ch in s_norm if unicodedata.category(ch) != 'Mn')
 
 
 def _premieres_k_lignes_non_vides(s: str, k: int) -> list:
@@ -222,28 +228,17 @@ def _dernieres_k_lignes_non_vides(s: str, k: int) -> list:
 def nettoyer_entetes_pieds_multilignes(textes_par_page: list,
                                        k_lignes: int = 3,
                                        seuil_ratio: float = 0.6) -> list:
-    """Retirer des bandeaux multi-lignes répétés en haut et en bas.
-    Méthode
-      1. On prélève pour chaque page les k premières et k dernières lignes non vides
-      2. On normalise et on compte les occurrences de séquences (jusqu'à k lignes)
-      3. On retire des pages toutes les séquences qui dépassent le seuil de répétition
-    """
+    """Retirer des bandeaux multi-lignes répétés en haut et en bas."""
     n = len(textes_par_page)
     if n == 0:
         return textes_par_page
 
-    # Collecte des candidates
     top_seqs = Counter()
     bot_seqs = Counter()
-    tops_by_page = []
-    bots_by_page = []
 
     for p in textes_par_page:
         top = _premieres_k_lignes_non_vides(p, k_lignes)
         bot = _dernieres_k_lignes_non_vides(p, k_lignes)
-        tops_by_page.append(top)
-        bots_by_page.append(bot)
-        # toutes les longueurs possibles 1..k
         for L in range(1, k_lignes + 1):
             if len(top) >= L:
                 norm = tuple(_normaliser_ligne(x) for x in top[:L])
@@ -254,12 +249,10 @@ def nettoyer_entetes_pieds_multilignes(textes_par_page: list,
                 if all(norm):
                     bot_seqs[norm] += 1
 
-    # Sélection des séquences à retirer
     seuil_pages = max(2, int(seuil_ratio * n))
     tops_a_retirer = {seq for seq, c in top_seqs.items() if c >= seuil_pages}
     bots_a_retirer = {seq for seq, c in bot_seqs.items() if c >= seuil_pages}
 
-    # Retrait effectif
     nettoyees = []
     for p in textes_par_page:
         lignes = p.splitlines()
@@ -268,7 +261,6 @@ def nettoyer_entetes_pieds_multilignes(textes_par_page: list,
             cand = _premieres_k_lignes_non_vides("\n".join(lignes), L)
             norm = tuple(_normaliser_ligne(x) for x in cand[:L])
             if norm and norm in tops_a_retirer:
-                # supprimer exactement L lignes non vides à partir du haut
                 to_remove = L
                 new_lines = []
                 skipped = 0
@@ -278,13 +270,12 @@ def nettoyer_entetes_pieds_multilignes(textes_par_page: list,
                         continue
                     new_lines.append(l)
                 lignes = new_lines
-                break  # on réévalue pas d'autres L
+                break
         # Retrait bas
         for L in range(k_lignes, 0, -1):
             cand = _dernieres_k_lignes_non_vides("\n".join(lignes), L)
             norm = tuple(_normaliser_ligne(x) for x in cand[-L:])
             if norm and norm in bots_a_retirer:
-                # supprimer exactement L lignes non vides à partir du bas
                 to_remove = L
                 new_lines = []
                 skipped = 0
@@ -319,15 +310,48 @@ def supprimer_cesures_en_fin_de_ligne(texte: str) -> str:
     return re.sub(r"-\n(\S)", r"\1", texte)
 
 
+def _ligne_correspond_a_un_motif(ligne: str, compiled_patterns) -> bool:
+    """Tester la ligne contre plusieurs variantes normalisées et les regex fournies."""
+    s = ligne.strip()
+    if not s:
+        return False
+    variants = []
+
+    # Variantes
+    s1 = re.sub(r"\s+", " ", s)               # espaces compactés
+    s2 = re.sub(r"\s+", "", s)                # sans espaces
+    s3 = _strip_accents(s1)                   # sans accents (espaces compactés)
+    s4 = _strip_accents(s2)                   # sans accents et sans espaces
+
+    variants.extend([s, s1, s2, s3, s4])
+
+    # Comparaison en ignorant la casse ; fullmatch sur les variantes
+    for cp in compiled_patterns:
+        for v in variants:
+            if cp.fullmatch(v, pos=0, endpos=len(v)):
+                return True
+    return False
+
+
 def appliquer_regex_personnalisees(texte: str, motifs_raw: str) -> str:
-    """Appliquer des regex ligne entière. Un motif par ligne, syntaxe Python, option IGNORECASE."""
+    """Appliquer des regex robustes : suppression de lignes qui correspondent aux motifs
+    après normalisations (espaces/accents). Un motif par ligne.
+    """
     motifs = [m.strip() for m in motifs_raw.splitlines() if m.strip()]
     if not motifs:
         return texte
+
+    compiled = []
+    for m in motifs:
+        try:
+            compiled.append(re.compile(m, flags=re.IGNORECASE))
+        except re.error:
+            # motif invalide : on l'escapera automatiquement (sécurité)
+            compiled.append(re.compile(re.escape(m), flags=re.IGNORECASE))
+
     res = []
-    compiled = [re.compile(m, flags=re.IGNORECASE) for m in motifs]
     for l in texte.splitlines():
-        if any(c.fullmatch(l.strip()) for c in compiled):
+        if _ligne_correspond_a_un_motif(l, compiled):
             continue
         res.append(l)
     return "\n".join(res)
@@ -518,11 +542,16 @@ with st.sidebar:
         seuil_ratio_ep = st.slider("Seuil de répétition pour suppression", min_value=0.4, max_value=0.9, value=0.6, step=0.05,
                                    help="Proportion minimale de pages où le motif apparaît pour être supprimé.")
 
+        # Motifs fournis (pré-remplis). Le moteur de nettoyage les rend robustes aux espaces/accents.
         motifs_regex_ep = st.text_area(
-            "Motifs regex personnalisés (optionnel, un par ligne, appliqués en suppression ligne entière)",
-            value="^\\s*CHAMBRE DES REPRÉSENTANTS.*$\\s*\n^\\s*BELGISCHE KAMER.*$\\s*\n^\\s*DOC\\s*\\d+.*$\\s*\n^\\s*\\d+\\s*$\\s*",
+            "Motifs regex personnalisés (un par ligne, correspondance sur la ligne entière après normalisations)",
+            value=(
+                "H AMB R E 4 e S E S S ION D E L A 5 3 e L É G I S L A T U R E 2012 2013 KAMER 4 e ZI T T ING VAN DE 5 3 e ZI T T INGS P ERIODE\n"
+                "DOC 53 2880/001 3"
+            ),
             height=120,
-            help="Exemples adaptés aux bandeaux récurrents. Lignes correspondantes seront supprimées partout."
+            help="Ces deux motifs sont ceux que vous avez fournis (pied et haut de page). "
+                 "Ils sont comparés à des variantes normalisées (espaces/accents) pour une suppression robuste."
         )
 
         to_lower = st.checkbox("Passer tout le texte en minuscules", value=False)
