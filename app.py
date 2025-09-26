@@ -546,9 +546,9 @@ with st.sidebar:
                                    help="Proportion minimale de pages où le motif apparaît pour être supprimé.")
 
         # Motifs fournis (pré-remplis). Formes compactes, robustes via normalisations (espaces/accents).
-        motifs_regex_ep = st.text_area(
-        "Motifs regex personnalisés (un par ligne, correspondance sur la ligne entière après normalisations)",
-        value=(
+motifs_regex_ep = st.text_area(
+    "Motifs regex personnalisés (un par ligne, correspondance sur la ligne entière après normalisations)",
+    value=(
         "^CHAMBRE4eSESSIONDELA53eLEGISLATURE$\n"
         "^2012$\n"
         "^DOC532880/0013$\n"
@@ -556,13 +556,14 @@ with st.sidebar:
         "^2013$\n"
         "^DOC53$\n"
         "^2880/001$"
-        ),
-        height=120,
-        help="Formes compactes pensées pour matcher après normalisations (espaces/accents retirés). "
+    ),
+    height=120,
+    help="Formes compactes pensées pour matcher après normalisations (espaces/accents retirés). "
          "Ajoutez vos motifs, un par ligne."
-        )
+)
 
 to_lower = st.checkbox("Passer tout le texte en minuscules", value=False)
+
 
 
 
