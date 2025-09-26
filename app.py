@@ -1,4 +1,4 @@
-# www.codeandecortex.fr
+# www.codeandcortex.fr
 # Stéphane Meurisse
 # 26 septembre 2025
 #
