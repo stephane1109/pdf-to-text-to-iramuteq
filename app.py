@@ -480,6 +480,17 @@ st.write(
     "intervalle de pages, variables étoilées en tête, nettoyages, regex..."
 )
 
+# Bandeau sous le titre (site)
+st.markdown(
+    """
+<hr style="margin-top:0.5rem;margin-bottom:0.75rem;">
+<div style="display:flex;flex-direction:column;gap:0.25rem;font-size:0.95rem;">
+  <div><a href="https://www.codeandcortex.fr" target="_blank">www.codeandcortex.fr</a></div>
+</div>
+""",
+    unsafe_allow_html=True,
+)
+
 with st.sidebar:
     st.header("Paramètres d'extraction")
 
@@ -563,8 +574,6 @@ with st.sidebar:
 )
 
     to_lower = st.checkbox("Passer tout le texte en minuscules", value=False)
-
-
 
 
 
