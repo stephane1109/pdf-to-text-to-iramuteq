@@ -1,4 +1,7 @@
-# app.py
+# www.codeandecortex.fr
+# Stéphane Meurisse
+# 26 septembre 2025
+#
 # ------------------------------------------------------------
 # Extraction PDF -> .txt (PyMuPDF uniquement)
 # Largeur 'wide', bandeau sous le titre (site), multi-fichiers
