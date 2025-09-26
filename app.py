@@ -546,7 +546,7 @@ with st.sidebar:
                                    help="Proportion minimale de pages où le motif apparaît pour être supprimé.")
 
         # Motifs fournis (pré-remplis). Formes compactes, robustes via normalisations (espaces/accents).
-motifs_regex_ep = st.text_area(
+    motifs_regex_ep = st.text_area(
     "Motifs regex personnalisés (un par ligne, correspondance sur la ligne entière après normalisations)",
     value=(
         "^CHAMBRE4eSESSIONDELA53eLEGISLATURE$\n"
@@ -562,7 +562,7 @@ motifs_regex_ep = st.text_area(
          "Ajoutez vos motifs, un par ligne."
 )
 
-to_lower = st.checkbox("Passer tout le texte en minuscules", value=False)
+    to_lower = st.checkbox("Passer tout le texte en minuscules", value=False)
 
 
 
